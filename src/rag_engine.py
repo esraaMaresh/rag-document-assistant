@@ -1,62 +1,67 @@
-from google import genai
+import os
+
+# 1. STOP HuggingFace from pinging external servers (kills the 180s timeout!)
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+import chromadb
+from chromadb.config import Settings
+from chromadb.utils import embedding_functions
 from typing import List, Dict
-import time
 
-SYSTEM_INSTRUCTION = """
-You are an expert Document Intelligence Assistant. 
-Answer the user's question accurately using ONLY the provided Context Chunks.
-Guidelines:
-1. Always base your answer strictly on the context. If the answer cannot be found in the context, explicitly say: "I cannot find information about this in the provided document."
-2. Cite the exact page number(s) where you found the information (e.g. "[Page 3]").
-3. Keep your answers clear, structured, and factual.
-"""
+class VectorStoreManager:
+    def __init__(self, collection_name: str = "pdf_rag_collection"):
+        # Local embeddings strictly offline
+        self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="all-MiniLM-L6-v2"
+        )
+        # Disable ChromaDB external telemetry pings
+        self.client = chromadb.Client(Settings(anonymized_telemetry=False))
+        self.collection_name = collection_name
+        self._reset_collection()
 
-# Current high-availability models (Flash-Lite handles high-demand traffic best)
-MODELS_TO_TRY = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
-    "gemini-3.6-flash"
-]
+    def _reset_collection(self):
+        try:
+            self.client.delete_collection(name=self.collection_name)
+        except Exception:
+            pass
+        self.collection = self.client.create_collection(
+            name=self.collection_name,
+            embedding_function=self.embedding_fn
+        )
 
-def generate_answer(query: str, context_chunks: List[Dict], api_key: str) -> str:
-    """Sends query + context to Gemini with automatic model fallback."""
-    client = genai.Client(api_key=api_key)
+    def add_chunks(self, chunks: List[Dict], doc_name: str):
+        """Adds text chunks with metadata to ChromaDB."""
+        self._reset_collection()
+        
+        documents = [c["content"] for c in chunks]
+        metadatas = [{"source": doc_name, "page": c["page"]} for c in chunks]
+        ids = [f"chunk_{i}" for i in range(len(chunks))]
 
-    context_text = "\n\n".join([
-        f"--- Context Snippet (Source: {c['source']}, Page: {c['page']}) ---\n{c['content']}"
-        for c in context_chunks
-    ])
+        if documents:
+            self.collection.add(
+                documents=documents,
+                metadatas=metadatas,
+                ids=ids
+            )
 
-    user_prompt = f"""
-Context:
-{context_text}
+    def search(self, query: str, top_k: int = 4) -> List[Dict]:
+        """Searches for the most semantically relevant chunks."""
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=top_k
+        )
 
-User Question: {query}
+        formatted_results = []
+        if results and results["documents"]:
+            docs = results["documents"][0]
+            metas = results["metadatas"][0]
+            
+            for doc, meta in zip(docs, metas):
+                formatted_results.append({
+                    "content": doc,
+                    "page": meta["page"],
+                    "source": meta["source"]
+                })
 
-Please provide a grounded answer with page citations based on the context above:
-"""
-
-    last_error = None
-    for model_name in MODELS_TO_TRY:
-        # Try each model up to 2 times if temporary high demand
-        for attempt in range(2):
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=user_prompt,
-                    config={
-                        "system_instruction": SYSTEM_INSTRUCTION
-                    }
-                )
-                return response.text
-            except Exception as e:
-                last_error = e
-                err_str = str(e).lower()
-                # If 503, 429, or temporary high demand, wait briefly and try next
-                if "503" in err_str or "high demand" in err_str or "429" in err_str:
-                    time.sleep(1.5)
-                    continue
-                else:
-                    break
-
-    raise last_error
+        return formatted_results
